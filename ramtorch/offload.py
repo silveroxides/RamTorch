@@ -119,10 +119,8 @@ Notes
 from __future__ import annotations
 
 import contextlib
-import grp
 import json
 import os
-import pwd
 import queue
 import threading
 import time
@@ -136,6 +134,12 @@ from torch.profiler import record_function
 
 from .nvme_store import NvmeTensorStore
 from .offload_simulator import evenly_pinned, interleaved_nvme
+
+try:  # POSIX-only; _is_sudoer() already fails closed elsewhere.
+    import grp
+    import pwd
+except ImportError:  # pragma: no cover - Windows
+    grp = pwd = None
 
 __all__ = ["OffloadModel", "OffloadStepResult", "offload_checkpoint"]
 
@@ -199,6 +203,8 @@ def _is_sudoer() -> bool:
     lookup error (non-POSIX host, missing groups) counts as not a sudoer.
     """
     try:
+        if grp is None or pwd is None:
+            return False
         if os.geteuid() == 0:
             return True
         uid, gid = os.geteuid(), os.getegid()
@@ -540,6 +546,13 @@ class OffloadModel(nn.Module):
                  offload kicks in (default 2 — simulator sweet spot: one
                  in compute + one prefetched; raise it to trade GPU memory
                  for less PCIe traffic).
+    nvme_io_backend : ``"auto"``/``"python"`` uses the portable bounded
+                 pinned-buffer reader for NVMe masters. ``"aimdo"`` uses
+                 AIMDO's native file-reader ring and is inference-only.
+    residency_backend : ``"stream"`` is the normal CPU->GPU window.
+                 ``"aimdo-vbar"`` is an experimental inference-only VBAR
+                 cache; launch through ``ramtorch-aimdo`` before importing
+                 PyTorch, because AIMDO must install its runtime first.
     """
 
     def __init__(
@@ -558,6 +571,8 @@ class OffloadModel(nn.Module):
         acc_slots: Optional[int] = None,
         offload_activations: bool = False,
         act_slots: int = 2,
+        nvme_io_backend: str = "auto",
+        residency_backend: str = "stream",
     ):
         super().__init__()
         if len(chunks) < 1:
@@ -583,6 +598,16 @@ class OffloadModel(nn.Module):
             )
         if act_slots < 1:
             raise ValueError(f"act_slots must be >= 1, got {act_slots}")
+        if nvme_io_backend not in ("auto", "python", "aimdo"):
+            raise ValueError(
+                "nvme_io_backend must be 'auto', 'python', or 'aimdo', "
+                f"got {nvme_io_backend!r}"
+            )
+        if residency_backend not in ("stream", "aimdo-vbar"):
+            raise ValueError(
+                "residency_backend must be 'stream' or 'aimdo-vbar', "
+                f"got {residency_backend!r}"
+            )
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -626,6 +651,11 @@ class OffloadModel(nn.Module):
         self.acc_slots = window if acc_slots is None else acc_slots
         self.offload_activations = bool(offload_activations)
         self.act_slots = act_slots
+        # ``auto`` intentionally chooses the portable implementation. AIMDO
+        # must be bootstrapped before Torch, so selecting it implicitly would
+        # make a normal RamTorch process depend on import order.
+        self.nvme_io_backend = "python" if nvme_io_backend == "auto" else nvme_io_backend
+        self.residency_backend = residency_backend
 
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
@@ -635,6 +665,18 @@ class OffloadModel(nn.Module):
                         nvme=i in nvme_idx, idx=i, pin_acc=pin_acc)
             for i, m in enumerate(self.chunks)
         ]
+        self._aimdo_residency = None
+        if residency_backend == "aimdo-vbar":
+            if not self._cuda:
+                raise ValueError("residency_backend='aimdo-vbar' requires CUDA/ROCm")
+            if keep_activations:
+                raise ValueError(
+                    "residency_backend='aimdo-vbar' is inference-only; "
+                    "use keep_activations=False"
+                )
+            from .aimdo import AimdoResidency
+            self._aimdo_residency = AimdoResidency(self._state, self.device)
+        self._aimdo_api = None
 
         # rehome NVMe masters onto one file mapping (frees their RAM copies)
         self._nvme_store: Optional[NvmeTensorStore] = None
@@ -931,10 +973,34 @@ class OffloadModel(nn.Module):
         for n, t in state.tensors.items():
             nb = t.numel() * t.element_size()
             v = self._nvme_staging[off:off + nb].view(t.dtype).view(t.shape)
-            v.copy_(t)
+            if self.nvme_io_backend == "python":
+                assert self._nvme_store is not None
+                self._nvme_store.readinto(
+                    f"{state.idx}.{n}", self._nvme_staging[off:off + nb]
+                )
+            else:
+                v.copy_(t)
             views[n] = v
             off += -(-nb // align) * align
         return views
+
+    def _materialize_nvme_aimdo(self, state: _ChunkState) -> Dict[str, torch.Tensor]:
+        """Queue native file -> pinned-host -> device transfers for one chunk."""
+        if self._aimdo_api is None:
+            from .aimdo import require_aimdo
+            self._aimdo_api = require_aimdo(self.device)
+        assert self._nvme_store is not None and self._h2d_stream is not None
+        out = {}
+        stream = int(self._h2d_stream.cuda_stream)
+        for n, source in state.tensors.items():
+            offset, nbytes = self._nvme_store.file_slice(f"{state.idx}.{n}")
+            gpu = torch.empty_like(source, device=self.device)
+            self._aimdo_api.read_file_to_device(
+                self._nvme_store.reader, offset, nbytes, stream,
+                gpu.data_ptr(), self.device.index,
+            )
+            out[n] = gpu
+        return out
 
     def _materialize(self, state: _ChunkState) -> Dict[str, torch.Tensor]:
         """Produce a chunk's device tensors (runs on the loader thread).
@@ -949,6 +1015,10 @@ class OffloadModel(nn.Module):
         read pinned memory.
         """
         src = state.tensors
+        if self._aimdo_residency is not None:
+            return self._aimdo_residency.materialize(state.idx, src)
+        if state.nvme and self._cuda and self.nvme_io_backend == "aimdo":
+            return self._materialize_nvme_aimdo(state)
         if state.nvme and self._cuda:
             src = self._stage_nvme(state)
 
@@ -1158,6 +1228,7 @@ class OffloadModel(nn.Module):
     def _release(self):
         """Advance the itinerary position and wake the loader."""
         with self._cv:
+            layer = self._in_use
             self._in_use = None
             self._fpos += 1
             # compact the consumed prefix now and then
@@ -1166,6 +1237,8 @@ class OffloadModel(nn.Module):
                 del self._future_kinds[: self._fpos]
                 self._fpos = 0
             self._cv.notify_all()
+        if self._aimdo_residency is not None and layer is not None:
+            self._aimdo_residency.release(layer)
 
     def _announce(self, itinerary: List[int],
                   kinds: Optional[Sequence[str]] = None):
@@ -1467,6 +1540,12 @@ class OffloadModel(nn.Module):
         kernel and memcpy — and write Chrome-trace JSON to this path. Drop
         the file into https://ui.perfetto.dev to inspect the overlap.
         """
+        if self.residency_backend == "aimdo-vbar":
+            raise RuntimeError("AIMDO VBAR residency is inference-only; use forward()")
+        if self.nvme_io_backend == "aimdo":
+            raise RuntimeError(
+                "AIMDO NVMe I/O is inference-only; use nvme_io_backend='python' for step()"
+            )
         if grad_outputs is not None and loss_fn is not None:
             raise ValueError(
                 "grad_outputs and loss_fn are mutually exclusive: grad "
@@ -2003,6 +2082,9 @@ class OffloadModel(nn.Module):
         if self._nvme_store is not None:
             self._nvme_store.close()
             self._nvme_store = None
+        if self._aimdo_residency is not None:
+            self._aimdo_residency.close()
+            self._aimdo_residency = None
 
     def __del__(self):
         try:

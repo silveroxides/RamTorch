@@ -5,6 +5,8 @@ authors = [{name = "Lodestone", email = "lodestone.rock@gmail.com"}]
 description = "RAM is All You Need"
 readme = "README.md"
 requires-python = ">=3.8"
+dependencies = ["torch"]
+license = {text = "Apache-2.0"}
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -18,9 +20,16 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/lodestone-rock/RamTorch"
 
+[project.optional-dependencies]
+aimdo = ["comfy-aimdo>=0.4.5"]
+
+[project.scripts]
+ramtorch-aimdo = "ramtorch_aimdo_bootstrap:main"
+
 [tool.setuptools.packages.find]
 include = ["ramtorch*"]
 exclude = ["examples*", "env*", "scraped*", "kernels*", "data*", "tests*"]
 
 [tool.setuptools]
 license-files = []
+py-modules = ["ramtorch_aimdo_bootstrap"]

@@ -28,6 +28,7 @@ the loader thread ("slower H2D", see ``ramtorch.offload_simulator``).
 from __future__ import annotations
 
 import os
+import ctypes
 from typing import Dict, Optional
 
 import torch
@@ -63,6 +64,7 @@ class NvmeTensorStore:
         self.path = str(path)
         self._base: Optional[torch.Tensor] = None  # uint8 view of the file
         self._layout: Dict[str, tuple] = {}        # name -> (offset, nbytes)
+        self._reader = None
 
     @property
     def nbytes(self) -> int:
@@ -113,6 +115,45 @@ class NvmeTensorStore:
         v = self._base[off:off + nb].view(dtype)
         return v.view(shape)
 
+    def file_slice(self, name: str) -> tuple:
+        """Return the byte offset and size of a stored tensor.
+
+        The offload engine uses this to bypass mmap page faults on its NVMe
+        path and fill pinned staging buffers directly from the backing file.
+        """
+        return self._layout[name]
+
+    def readinto(self, name: str, destination: torch.Tensor) -> None:
+        """Synchronously read one tensor payload into a CPU byte tensor.
+
+        ``destination`` must be a contiguous uint8 view with at least the
+        tensor's byte length.  Keeping this primitive here makes the storage
+        layout the sole source of truth for both mmap and streaming readers.
+        """
+        offset, nbytes = self.file_slice(name)
+        if destination.device.type != "cpu" or destination.dtype != torch.uint8:
+            raise ValueError("destination must be a CPU uint8 tensor")
+        if not destination.is_contiguous() or destination.numel() < nbytes:
+            raise ValueError("destination is too small or non-contiguous")
+        if self._reader is None:
+            self._reader = open(self.path, "rb", buffering=0)
+        self._reader.seek(offset)
+        raw = (ctypes.c_uint8 * nbytes).from_address(destination.data_ptr())
+        view = memoryview(raw)
+        total = 0
+        while total < nbytes:
+            got = self._reader.readinto(view[total:])
+            if not got:
+                raise EOFError(f"short read for NVMe tensor {name!r}")
+            total += got
+
+    @property
+    def reader(self):
+        """The backing file object, opened lazily for native I/O backends."""
+        if self._reader is None:
+            self._reader = open(self.path, "rb", buffering=0)
+        return self._reader
+
     def close(self, unlink: bool = True) -> None:
         """Drop the mapping reference and (by default) delete the file.
 
@@ -120,6 +161,9 @@ class NvmeTensorStore:
         tensor viewing it is garbage collected, so existing views stay
         valid; the disk space is reclaimed when they go.
         """
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
         self._base = None
         self._layout = {}
         if unlink:
