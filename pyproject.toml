@@ -22,6 +22,7 @@ Homepage = "https://github.com/lodestone-rock/RamTorch"
 
 [project.optional-dependencies]
 aimdo = ["comfy-aimdo>=0.4.5"]
+uel = ["unifiedefficientloader>=0.5.4"]
 
 [project.scripts]
 ramtorch-aimdo = "ramtorch_aimdo_bootstrap:main"

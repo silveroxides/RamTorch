@@ -15,7 +15,10 @@ setup(
     url="https://github.com/lodestone-rock/RamTorch",
     packages=find_packages(include=["ramtorch", "ramtorch.*"]),
     install_requires=["torch"],
-    extras_require={"aimdo": ["comfy-aimdo>=0.4.5"]},
+    extras_require={
+        "aimdo": ["comfy-aimdo>=0.4.5"],
+        "uel": ["unifiedefficientloader>=0.5.4"],
+    },
     py_modules=["ramtorch_aimdo_bootstrap"],
     entry_points={"console_scripts": ["ramtorch-aimdo=ramtorch_aimdo_bootstrap:main"]},
     classifiers=[

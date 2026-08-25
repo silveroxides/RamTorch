@@ -9,6 +9,7 @@ from .pipeline_optimizer import PipelineOptimizer
 from .offload import OffloadModel, OffloadStepResult, offload_checkpoint
 from .pipeline_offload import OffloadStage
 from .nvme_store import NvmeTensorStore
+from .uel import AsyncSafetensorsSource, save_safetensors_incremental
 from . import schedule_simulator
 from . import offload_simulator
 from . import pipeline_offload_simulator
@@ -30,6 +31,8 @@ __all__ = [
     "offload_checkpoint",
     "OffloadStage",
     "NvmeTensorStore",
+    "AsyncSafetensorsSource",
+    "save_safetensors_incremental",
     "schedule_simulator",
     "offload_simulator",
     "pipeline_offload_simulator",

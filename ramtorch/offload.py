@@ -553,6 +553,10 @@ class OffloadModel(nn.Module):
                  ``"aimdo-vbar"`` is an experimental inference-only VBAR
                  cache; launch through ``ramtorch-aimdo`` before importing
                  PyTorch, because AIMDO must install its runtime first.
+    uel_path, uel_key_map : inference-only safetensors source driven by the
+                 published ``unifiedefficientloader`` async reader. The map
+                 is ``{"{chunk}.{tensor}": "checkpoint_key"}``; UEL reads
+                 upcoming tensors concurrently while this engine computes.
     """
 
     def __init__(
@@ -573,6 +577,9 @@ class OffloadModel(nn.Module):
         act_slots: int = 2,
         nvme_io_backend: str = "auto",
         residency_backend: str = "stream",
+        uel_path: Optional[str] = None,
+        uel_key_map: Optional[Dict[str, str]] = None,
+        uel_prefetch_batches: int = 2,
     ):
         super().__init__()
         if len(chunks) < 1:
@@ -608,6 +615,12 @@ class OffloadModel(nn.Module):
                 "residency_backend must be 'stream' or 'aimdo-vbar', "
                 f"got {residency_backend!r}"
             )
+        if (uel_path is None) != (uel_key_map is None):
+            raise ValueError("uel_path and uel_key_map must be provided together")
+        if uel_prefetch_batches < 1:
+            raise ValueError("uel_prefetch_batches must be >= 1")
+        if uel_path is not None and keep_activations:
+            raise ValueError("UEL weight streaming is inference-only; use keep_activations=False")
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -656,6 +669,7 @@ class OffloadModel(nn.Module):
         # make a normal RamTorch process depend on import order.
         self.nvme_io_backend = "python" if nvme_io_backend == "auto" else nvme_io_backend
         self.residency_backend = residency_backend
+        self.uel_path = uel_path
 
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
@@ -677,6 +691,12 @@ class OffloadModel(nn.Module):
             from .aimdo import AimdoResidency
             self._aimdo_residency = AimdoResidency(self._state, self.device)
         self._aimdo_api = None
+        self._uel_source = None
+        if uel_path is not None:
+            from .uel import AsyncSafetensorsSource
+            self._uel_source = AsyncSafetensorsSource(
+                uel_path, uel_key_map, prefetch_batches=uel_prefetch_batches
+            )
 
         # rehome NVMe masters onto one file mapping (frees their RAM copies)
         self._nvme_store: Optional[NvmeTensorStore] = None
@@ -1015,6 +1035,8 @@ class OffloadModel(nn.Module):
         read pinned memory.
         """
         src = state.tensors
+        if self._uel_source is not None:
+            src = self._uel_source.take_chunk(state.idx, src)
         if self._aimdo_residency is not None:
             return self._aimdo_residency.materialize(state.idx, src)
         if state.nvme and self._cuda and self.nvme_io_backend == "aimdo":
@@ -1489,6 +1511,8 @@ class OffloadModel(nn.Module):
         ``x`` may be a single tensor or a tuple; a chunk returning a tuple
         feeds its elements as positional args to the next chunk.
         """
+        if self._uel_source is not None:
+            self._uel_source.start_pass()
         self._announce(list(range(self.n)))
         hs = self._to_device_args(x)
         raw = hs[0]
@@ -1542,6 +1566,8 @@ class OffloadModel(nn.Module):
         """
         if self.residency_backend == "aimdo-vbar":
             raise RuntimeError("AIMDO VBAR residency is inference-only; use forward()")
+        if self._uel_source is not None:
+            raise RuntimeError("UEL weight streaming is inference-only; use forward()")
         if self.nvme_io_backend == "aimdo":
             raise RuntimeError(
                 "AIMDO NVMe I/O is inference-only; use nvme_io_backend='python' for step()"
@@ -2085,6 +2111,9 @@ class OffloadModel(nn.Module):
         if self._aimdo_residency is not None:
             self._aimdo_residency.close()
             self._aimdo_residency = None
+        if self._uel_source is not None:
+            self._uel_source.close()
+            self._uel_source = None
 
     def __del__(self):
         try:
